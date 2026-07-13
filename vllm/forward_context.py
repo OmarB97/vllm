@@ -134,6 +134,10 @@ class ForwardContext:
     no_compile_layers: dict[str, Any]
     attn_metadata: dict[str, AttentionMetadata] | list[dict[str, AttentionMetadata]]
     slot_mapping: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]]
+    token_slot_mapping: torch.Tensor | list[torch.Tensor] | None = None
+    # True when any real request is still consuming prompt tokens. None is
+    # reserved for dummy/profile forwards that lack request lifecycle state.
+    has_prefill: bool | None = None
     """
     Type Dict[str, AttentionMetadata] for v1, map from layer_name of each
     attention layer to its attention metadata
@@ -217,6 +221,8 @@ def create_forward_context(
     batch_descriptor: BatchDescriptor | None = None,
     ubatch_slices: UBatchSlices | None = None,
     slot_mapping: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None = None,
+    token_slot_mapping: torch.Tensor | list[torch.Tensor] | None = None,
+    has_prefill: bool | None = None,
     additional_kwargs: dict[str, Any] | None = None,
     skip_compiled: bool = False,
     is_padding: torch.Tensor | None = None,
@@ -231,6 +237,8 @@ def create_forward_context(
         all_moe_layers=all_moe_layers,
         attn_metadata=attn_metadata,
         slot_mapping=slot_mapping or {},
+        token_slot_mapping=token_slot_mapping,
+        has_prefill=has_prefill,
         dp_metadata=dp_metadata,
         cudagraph_runtime_mode=cudagraph_runtime_mode,
         batch_descriptor=batch_descriptor,
@@ -266,6 +274,8 @@ def set_forward_context(
     batch_descriptor: BatchDescriptor | None = None,
     ubatch_slices: UBatchSlices | None = None,
     slot_mapping: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None = None,
+    token_slot_mapping: torch.Tensor | list[torch.Tensor] | None = None,
+    has_prefill: bool | None = None,
     skip_compiled: bool = False,
     is_padding: torch.Tensor | None = None,
 ):
@@ -333,9 +343,11 @@ def set_forward_context(
         cudagraph_runtime_mode,
         batch_descriptor,
         ubatch_slices,
-        slot_mapping,
-        additional_kwargs,
-        skip_compiled,
+        slot_mapping=slot_mapping,
+        token_slot_mapping=token_slot_mapping,
+        has_prefill=has_prefill,
+        additional_kwargs=additional_kwargs,
+        skip_compiled=skip_compiled,
         is_padding=is_padding,
     )
 

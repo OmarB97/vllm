@@ -57,7 +57,10 @@ from vllm.v1.metrics.perf import ModelMetrics, PerfStats
 from vllm.v1.metrics.stats import PrefixCacheStats, SchedulerStats
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
-from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
+from vllm.v1.spec_decode.dynamic.utils import (
+    DSparkLiveRederivation,
+    build_dynamic_sd_schedule_lookup,
+)
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
@@ -255,6 +258,8 @@ class Scheduler(SchedulerInterface):
                 # anchor itself is the first prediction position (no separate bonus
                 # query), so it needs exactly num_spec_tokens lookahead slots.
                 self.num_lookahead_tokens = self.num_spec_tokens
+                # Live dynamic-SD re-derivation, armed by set_dspark_cost_profile.
+                self._dspark_rederive: DSparkLiveRederivation | None = None
 
         # Create the KV cache manager.
         if hash_block_size is None:
@@ -441,6 +446,11 @@ class Scheduler(SchedulerInterface):
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
+
+            # Structured-output requests use the target model until the
+            # speculative verifier can commit grammar state sequentially.
+            if request.use_structured_output and request.spec_token_ids:
+                request.spec_token_ids = []
 
             if (
                 request.num_output_placeholders > 0
@@ -1612,6 +1622,11 @@ class Scheduler(SchedulerInterface):
                     num_invalid_spec_tokens=scheduler_output.num_invalid_spec_tokens,
                     request_id=req_id,
                 )
+                rederive = getattr(self, "_dspark_rederive", None)
+                if rederive is not None:
+                    lookup = rederive.observe(num_draft_tokens, num_accepted)
+                    if lookup is not None:
+                        self.dynamic_sd_lookup = lookup
 
             # Free encoder inputs only after the step has actually executed.
             if request.has_encoder_inputs:
@@ -1961,6 +1976,10 @@ class Scheduler(SchedulerInterface):
                     request.spec_token_ids = []
                 continue
 
+            if request.use_structured_output:
+                request.spec_token_ids = []
+                continue
+
             # Add newly generated spec token ids to the request.
             if self.structured_output_manager.should_advance(request):
                 metadata = request.structured_output_request
@@ -1990,8 +2009,10 @@ class Scheduler(SchedulerInterface):
             # Trim drafts to scheduled number of spec tokens
             # (needed for chunked prefill case for example).
             del spec_token_ids[orig_num_spec_tokens:]
+            if request.use_structured_output:
+                spec_token_ids = []
             # Filter out spec tokens which do not adhere to the grammar.
-            if self.structured_output_manager.should_advance(request):
+            elif self.structured_output_manager.should_advance(request):
                 metadata = request.structured_output_request
                 assert metadata is not None and metadata.grammar is not None
                 spec_token_ids = metadata.grammar.validate_tokens(spec_token_ids)
@@ -2309,6 +2330,17 @@ class Scheduler(SchedulerInterface):
             kv_connector_stats=connector_stats_payload,
             cudagraph_stats=cudagraph_stats,
             perf_stats=perf_stats,
+        )
+
+    def set_dspark_cost_profile(
+        self, r_grid: list[int], times_by_l: list[list[float]]
+    ) -> None:
+        """Arm live dynamic-SD re-derivation from realized acceptance."""
+        self._dspark_rederive = DSparkLiveRederivation(
+            r_grid,
+            times_by_l,
+            self.scheduler_config.max_num_seqs,
+            self.num_spec_tokens,
         )
 
     def make_spec_decoding_stats(

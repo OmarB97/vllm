@@ -253,6 +253,25 @@ class DefaultModelLoader(BaseModelLoader):
             source.fall_back_to_pt,
             source.allow_patterns_overrides,
         )
+        from vllm.model_executor.layers.quantization.utils import moe_w2_store
+
+        if (moe_w2_store.checkpoint_cache_safety_enabled()
+                and not use_safetensors):
+            raise RuntimeError(
+                f"load format {self.load_config.load_format!r} selected a "
+                "non-safetensors checkpoint path that bypasses the W2 "
+                "pack-store cache-safety hooks; use the default sequential "
+                "safetensors loader for a guarded restage")
+        if (moe_w2_store.checkpoint_cache_safety_enabled()
+                and extra_config.get("enable_multithread_load")
+                and self.load_config.safetensors_load_strategy not in (
+                    None, "lazy")):
+            raise RuntimeError(
+                "multi-thread safetensors loading cannot safely honor "
+                "safetensors_load_strategy="
+                f"{self.load_config.safetensors_load_strategy!r} while the "
+                "W2 pack-store guard is active; use the default sequential "
+                "lazy strategy")
         if self.load_config.load_format == "npcache":
             # Currently np_cache only support *.bin checkpoints
             assert use_safetensors is False
@@ -264,6 +283,13 @@ class DefaultModelLoader(BaseModelLoader):
                 self.load_config.use_tqdm_on_load,
             )
         elif use_safetensors:
+            if (moe_w2_store.checkpoint_cache_safety_enabled()
+                    and self.load_config.load_format in (
+                        "fastsafetensors", "instanttensor")):
+                raise RuntimeError(
+                    f"load format {self.load_config.load_format!r} bypasses "
+                    "the W2 pack-store checkpoint cache-safety hooks; use "
+                    "the default safetensors loader for a guarded restage")
             if self.load_config.load_format == "fastsafetensors":
                 weights_iterator = fastsafetensors_weights_iterator(
                     hf_weights_files,
@@ -316,7 +342,16 @@ class DefaultModelLoader(BaseModelLoader):
         if self.counter_before_loading_weights == 0.0:
             self.counter_before_loading_weights = time.perf_counter()
         # Apply the prefix.
-        return ((source.prefix + name, tensor) for (name, tensor) in weights_iterator)
+        def prefixed_weights_iterator():
+            try:
+                for name, tensor in weights_iterator:
+                    yield source.prefix + name, tensor
+            finally:
+                close = getattr(weights_iterator, "close", None)
+                if close is not None:
+                    close()
+
+        return prefixed_weights_iterator()
 
     def get_all_weights(
         self,
@@ -424,7 +459,23 @@ class DefaultModelLoader(BaseModelLoader):
 
         self._init_ep_weight_filter(model_config)
 
-        loaded_weights = model.load_weights(self.get_all_weights(model_config, model))
+        from vllm.model_executor.layers.quantization.utils import moe_w2_store
+
+        weights_iterator = self.get_all_weights(model_config, model)
+        try:
+            loaded_weights = model.load_weights(weights_iterator)
+        finally:
+            try:
+                # A model loader may stop consuming in the middle of a shard.
+                # Explicitly close the iterator so its per-shard finally runs
+                # and registers that shard before the post-consumer retry.
+                close = getattr(weights_iterator, "close", None)
+                if close is not None:
+                    close()
+            finally:
+                # The consumer's final `loaded_weight` local is gone only
+                # after model.load_weights unwinds. Retry every shard here.
+                moe_w2_store.checkpoint_cleanup_pending()
 
         self.counter_after_loading_weights = time.perf_counter()
         logger.info_once(

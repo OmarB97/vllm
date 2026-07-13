@@ -837,6 +837,15 @@ def safetensors_weights_iterator(
         loading_desc += " (eager)"
 
     sorted_files = sorted(hf_weights_files, key=_natural_sort_key)
+    from vllm.model_executor.layers.quantization.utils import moe_w2_store
+
+    w2_cache_safety = moe_w2_store.checkpoint_cache_safety_enabled()
+    if w2_cache_safety and safetensors_load_strategy == "torchao":
+        raise RuntimeError(
+            "torchao safetensors reconstruction can retain mmap-backed "
+            "tensors across shards and is not supported by the W2 pack-store "
+            "cache-safety path; use the default safetensors loader"
+        )
 
     fs_type = _get_fs_type(sorted_files)
     is_net_fs = fs_type in ("nfs", "nfs4", "lustre")
@@ -895,6 +904,19 @@ def safetensors_weights_iterator(
             avail_bytes / 1024**3,
         )
 
+    if w2_cache_safety and should_prefetch:
+        if safetensors_load_strategy == "prefetch":
+            raise RuntimeError(
+                "safetensors checkpoint prefetch is unsafe while a W2 pack "
+                "store is active: it can populate the entire checkpoint in "
+                "uncapped host page cache; use the default sequential loader"
+            )
+        logger.warning_once(
+            "Disabling automatic safetensors prefetch while the W2 pack-store "
+            "cache-safety guard is active"
+        )
+        should_prefetch = False
+
     if should_prefetch:
         _prefetch_all_checkpoints(
             sorted_files,
@@ -909,49 +931,78 @@ def safetensors_weights_iterator(
         disable=not enable_tqdm(use_tqdm_on_load),
         bar_format=_BAR_FORMAT,
     ):
-        if safetensors_load_strategy == "eager":
-            with open(st_file, "rb") as f:
-                state_dict = load(f.read())
-            for name, param in state_dict.items():
-                if not should_skip_weight(name, local_expert_ids):
-                    yield name, param
-        elif safetensors_load_strategy == "torchao":
-            # we can't load flattened torchao tensor subclasses directly into the model
-            # instead we reconstruct the subclasses here before returning
-            if not torchao_version_at_least("0.15.0"):
-                raise ValueError(
-                    "Please use torchao version >= 0.15.0 "
-                    "to load torchao safetensors checkpoint"
+        extra_bytes = (
+            os.path.getsize(st_file)
+            if w2_cache_safety and safetensors_load_strategy == "eager"
+            else 0
+        )
+        moe_w2_store.checkpoint_file_preflight(st_file, extra_bytes)
+        state_dict = None
+        unflattened_state_dict = None
+        param = None
+        try:
+            if safetensors_load_strategy == "eager":
+                with open(st_file, "rb") as f:
+                    state_dict = load(f.read())
+                for name, param in state_dict.items():
+                    if not should_skip_weight(name, local_expert_ids):
+                        yield name, param
+            elif safetensors_load_strategy == "torchao":
+                # we can't load flattened torchao tensor subclasses directly
+                # into the model
+                # instead we reconstruct the subclasses here before returning
+                if not torchao_version_at_least("0.15.0"):
+                    raise ValueError(
+                        "Please use torchao version >= 0.15.0 "
+                        "to load torchao safetensors checkpoint"
+                    )
+                from torchao.prototype.safetensors.safetensors_support import (
+                    unflatten_tensor_state_dict,
                 )
-            from torchao.prototype.safetensors.safetensors_support import (
-                unflatten_tensor_state_dict,
-            )
 
-            with safe_open(st_file, framework="pt") as f:
-                state_dict = {}
-                for name in f.keys():  # noqa: SIM118
-                    if should_skip_weight(name, local_expert_ids):
-                        continue
-                    state_dict[name] = f.get_tensor(name)
+                with safe_open(st_file, framework="pt") as f:
+                    state_dict = {}
+                    for name in f.keys():  # noqa: SIM118
+                        if should_skip_weight(name, local_expert_ids):
+                            continue
+                        state_dict[name] = f.get_tensor(name)
 
-                # update with leftover tensor data from previous iteration, if any
-                state_dict.update(leftover_state_dict)
-                metadata = f.metadata()
-                # due to sharded checkpoints, we are not guaranteed that we have all
-                # tensor subclass data on one file
-                # state_dict has the leftover data from this step and we wait for
-                # missing information to be provided in a future iteration
-                unflattened_state_dict, leftover_state_dict = (
-                    unflatten_tensor_state_dict(state_dict, metadata)
-                )
-            yield from unflattened_state_dict.items()
-        else:
-            with safe_open(st_file, framework="pt") as f:
-                for name in f.keys():  # noqa: SIM118
-                    if should_skip_weight(name, local_expert_ids):
-                        continue
-                    param = f.get_tensor(name)
-                    yield name, param
+                    # update with leftover tensor data from previous iteration, if any
+                    state_dict.update(leftover_state_dict)
+                    metadata = f.metadata()
+                    # due to sharded checkpoints, we are not guaranteed that we have all
+                    # tensor subclass data on one file
+                    # state_dict has the leftover data from this step and we wait for
+                    # missing information to be provided in a future iteration
+                    unflattened_state_dict, leftover_state_dict = (
+                        unflatten_tensor_state_dict(state_dict, metadata)
+                    )
+                yield from unflattened_state_dict.items()
+            else:
+                with safe_open(st_file, framework="pt") as f:
+                    names = [
+                        name
+                        for name in f.keys()  # noqa: SIM118
+                        if not should_skip_weight(name, local_expert_ids)
+                    ]
+                    for i, name in enumerate(names):
+                        param = f.get_tensor(name)
+                        if w2_cache_safety and i == len(names) - 1:
+                            param = moe_w2_store.guarded_checkpoint_clone(
+                                f"checkpoint shard tail {name}", param
+                            )
+                        yield name, param
+        finally:
+            # Release mmap-backed tensors before DONTNEED. This path also
+            # runs when the consumer closes or throws into the generator.
+            param = None
+            if state_dict is not None:
+                state_dict.clear()
+                state_dict = None
+            if unflattened_state_dict is not None:
+                unflattened_state_dict.clear()
+                unflattened_state_dict = None
+            moe_w2_store.checkpoint_file_done(st_file)
 
 
 def multi_thread_safetensors_weights_iterator(
@@ -960,6 +1011,37 @@ def multi_thread_safetensors_weights_iterator(
     max_workers: int = 4,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
     """Multi-Thread iterate over the weights in the model safetensor files."""
+
+    from vllm.model_executor.layers.quantization.utils import moe_w2_store
+
+    if moe_w2_store.checkpoint_cache_safety_enabled():
+        logger.warning_once(
+            "Serializing multi-thread safetensors loading while the W2 "
+            "pack-store cache-safety guard is active"
+        )
+        for st_file in tqdm(
+            sorted(hf_weights_files, key=_natural_sort_key),
+            desc="Loading safetensors checkpoint shards (W2 safe sequential)",
+            disable=not enable_tqdm(use_tqdm_on_load),
+            bar_format=_BAR_FORMAT,
+        ):
+            moe_w2_store.checkpoint_file_preflight(st_file)
+            state_dict = None
+            try:
+                state_dict = load_file(st_file, device="cpu")
+                keys = list(state_dict)
+                for i, key in enumerate(keys):
+                    tensor = state_dict.pop(key)
+                    if i == len(keys) - 1:
+                        tensor = moe_w2_store.guarded_checkpoint_clone(
+                            f"checkpoint shard tail {key}", tensor
+                        )
+                    yield key, tensor
+            finally:
+                if state_dict is not None:
+                    state_dict.clear()
+                moe_w2_store.checkpoint_file_done(st_file)
+        return
 
     def _load_file(st_file: str):
         result = load_file(st_file, device="cpu")

@@ -182,6 +182,17 @@ if TYPE_CHECKING:
     VLLM_MOE_USE_DEEP_GEMM: bool = True
     VLLM_USE_DEEP_GEMM_E8M0: bool = True
     VLLM_USE_DEEP_GEMM_TMA_ALIGNED_SCALES: bool = True
+    VLLM_MOE_W2: bool = False
+    VLLM_MOE_W2_STORE_DIR: str = ""
+    VLLM_MOE_W2_PACK_ID: str = ""
+    VLLM_MOE_W2_CACHE_CONTROL: Literal[
+        "required", "best-effort", "off"
+    ] = "required"
+    VLLM_MOE_W2_MIN_MEM_AVAILABLE_GB: float = 16.0
+    VLLM_MOE_W2_MIN_CGROUP_HEADROOM_GB: float = 4.0
+    # Opt-in: fused hand-written SASS (cubit) sparse-MLA on SM120 (experimental,
+    # eager only). See vllm/v1/attention/backends/mla/cubit_sparse_mla.py.
+    VLLM_SPARSE_MLA_CUBIT: bool | None = None
     VLLM_DEEP_GEMM_WARMUP: Literal[
         "skip",
         "full",
@@ -1467,6 +1478,29 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Whether to create TMA-aligned scale tensor when DeepGEMM is used.
     "VLLM_USE_DEEP_GEMM_TMA_ALIGNED_SCALES": lambda: bool(
         int(os.getenv("VLLM_USE_DEEP_GEMM_TMA_ALIGNED_SCALES", "1"))
+    ),
+    # W2 pack-store cold-build safety. The implementation reads these at the
+    # point of use; registration here prevents the generic unknown-VLLM-env
+    # guard from misclassifying the supported controls.
+    "VLLM_MOE_W2": lambda: bool(int(os.getenv("VLLM_MOE_W2", "0"))),
+    "VLLM_MOE_W2_STORE_DIR": lambda: os.getenv("VLLM_MOE_W2_STORE_DIR", ""),
+    "VLLM_MOE_W2_PACK_ID": lambda: os.getenv("VLLM_MOE_W2_PACK_ID", ""),
+    "VLLM_MOE_W2_CACHE_CONTROL": env_with_choices(
+        "VLLM_MOE_W2_CACHE_CONTROL", "required",
+        ["required", "best-effort", "off"]),
+    "VLLM_MOE_W2_MIN_MEM_AVAILABLE_GB": lambda: float(
+        os.getenv("VLLM_MOE_W2_MIN_MEM_AVAILABLE_GB", "16")),
+    "VLLM_MOE_W2_MIN_CGROUP_HEADROOM_GB": lambda: float(
+        os.getenv("VLLM_MOE_W2_MIN_CGROUP_HEADROOM_GB", "4")),
+    # Opt-in: fused hand-written SASS (cubit) sparse-MLA decode on SM120,
+    # replacing the Triton accumulate+finish pair for supported decode shapes.
+    # Experimental; requires eager mode. See
+    # vllm/v1/attention/backends/mla/cubit_sparse_mla.py.
+    "VLLM_SPARSE_MLA_CUBIT": lambda: (
+        None
+        if os.getenv("VLLM_SPARSE_MLA_CUBIT") is None
+        else os.getenv("VLLM_SPARSE_MLA_CUBIT", "").lower()
+        in ("1", "true", "yes", "on")
     ),
     # DeepGemm JITs the kernels on-demand. The warmup attempts to make DeepGemm
     # JIT all the required kernels before model execution so there is no

@@ -720,6 +720,31 @@ class Worker(WorkerBase):
         ):
             self.model_runner._init_kv_zero_meta()
 
+        # moe_w2 FP4 delta tier, auto pool sizing (VLLM_MOE_W2_DELTA_GB=auto):
+        # the KV cache now exists, so size the pool from the VRAM actually
+        # left over. Must run BEFORE compile_or_warm_up_model — cudagraph
+        # capture bakes the pool pointer into the graphs. No-op unless the
+        # tier exists with auto sizing pending.
+        try:
+            from vllm.model_executor.layers.quantization.utils import (
+                moe_w2_delta)
+            if moe_w2_delta._TIER is not None:
+                moe_w2_delta._TIER.finalize_auto()
+        except Exception as e:  # noqa: BLE001 - opt-in path, never fatal
+            logger.warning("moe_w2 delta auto-sizing failed: %s", e)
+
+        # moe_w2 BASE pool warm-start (VLLM_MOE_W2_POOL_HEAT): preload the
+        # previous run's hot ownership into the GPU slot pool. Same timing
+        # contract as finalize_auto: after weight load (host store staged)
+        # and BEFORE cudagraph capture (slot_table writes precede bake-in).
+        try:
+            from vllm.model_executor.layers.quantization.utils import (
+                moe_w2_delta)
+            if moe_w2_delta._BASE_TIER is not None:
+                moe_w2_delta._BASE_TIER.preload_pool()
+        except Exception as e:  # noqa: BLE001 - warm-start is best-effort
+            logger.warning("moe_w2 pool warm-start failed: %s", e)
+
     @instrument(span_name="Warmup (GPU)")
     def compile_or_warm_up_model(self) -> CompilationTimes:
         warmup_sizes: list[int] = []
@@ -905,6 +930,16 @@ class Worker(WorkerBase):
     def get_model(self) -> nn.Module:
         return self.model_runner.get_model()
 
+    def get_dspark_dynamic_sd_table(self) -> list[tuple[int, int, int]] | None:
+        getter = getattr(self.model_runner, "get_dspark_dynamic_sd_table", None)
+        return getter() if getter is not None else None
+
+    def get_dspark_cost_profile(
+        self,
+    ) -> tuple[list[int], list[list[float]]] | None:
+        getter = getattr(self.model_runner, "get_dspark_cost_profile", None)
+        return getter() if getter is not None else None
+
     def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
         return self.model_runner.get_supported_tasks()
 
@@ -1024,6 +1059,11 @@ class Worker(WorkerBase):
             if isinstance(
                 output, ModelRunnerOutput | AsyncModelRunnerOutput | NoneType
             ):
+                # Last PP rank: re-decide at FP4 (full pipeline) before sampling.
+                try:
+                    self._gate_pp_barrier(forward_pass)
+                finally:
+                    self._finish_w2_manager_step(forward_pass)
                 return output
 
         assert isinstance(output, IntermediateTensors)
@@ -1033,14 +1073,79 @@ class Worker(WorkerBase):
             and not get_pp_group().is_last_rank
         )
 
-        # launch non-blocking send of intermediate tensors
+        # launch non-blocking send of intermediate tensors.
+        # Under FULL cudagraphs the model output is a VIEW into the cudagraph
+        # memory pool, which the next graph replay (or any other captured
+        # graph) overwrites. The async isend below only guards buffer reuse
+        # via tensor.record_stream(), which is a NO-OP on graph-pool memory ->
+        # the next step can clobber the bytes while the send is still in
+        # flight, producing intermittent cross-stage hidden-state corruption
+        # that compounds over decode steps. Clone into fresh caching-allocator
+        # memory first: the clone is ordered after the graph replay on the
+        # current stream, and record_stream() then correctly defers its reuse
+        # until the send completes.
+        send_tensors = {
+            k: (v.clone() if v.is_cuda else v) for k, v in output.tensors.items()
+        }
         self._pp_send_work = get_pp_group().isend_tensor_dict(
-            output.tensors,
+            send_tensors,
             all_gather_group=get_tp_group(),
             all_gather_tensors=all_gather_tensors,
         )
 
+        # Non-last PP rank: participate in the gate barrier + (if fired) re-run
+        # this stage at FP4 for the full-pipeline re-decide.
+        try:
+            self._gate_pp_barrier(forward_pass)
+        finally:
+            self._finish_w2_manager_step(forward_pass)
         return None
+
+    def _finish_w2_manager_step(self, forward_pass: bool) -> None:
+        """Release tier managers only after every target/replay has drained."""
+        if not forward_pass or os.getenv("VLLM_MOE_W2", "0") != "1":
+            return
+        from vllm.model_executor.layers.quantization.utils import moe_w2_delta
+
+        moe_w2_delta.finish_forward_step()
+
+    def _gate_pp_barrier(self, forward_pass: bool) -> None:
+        """Confidence-gate full re-forward under PP (opt-in, VLLM_MOE_W2_GATE).
+
+        Called on EVERY rank after the first-pass forward+send. Broadcasts the
+        last rank's `fire` decision over the PP group so all ranks agree, then
+        (if fire) runs a full second pipeline pass via
+        model_runner.gate_reforward() on every rank. Single-stream PP: by here
+        the first pass has fully drained (the last rank already has logits), so
+        the broadcast cannot deadlock. No-op unless the gate is on AND
+        pp_world_size>1; the barrier collective runs only when the gate is
+        ARMED this step (`_gate_ctx` set identically on every rank by
+        execute_model: gate+PP+pure-decode) — on MTP/prefill steps every rank
+        skips together, so the base pipeline keeps its exact send/recv order.
+        """
+        if not forward_pass or os.getenv("VLLM_MOE_W2_GATE", "0") != "1":
+            return
+        pp = get_pp_group()
+        if pp.world_size <= 1:
+            return
+        if getattr(self.model_runner, "_gate_ctx", None) is None:
+            return
+        dev = self.model_runner.device
+        if pp.is_last_rank:
+            f = 1 if getattr(self.model_runner, "_gate_fire", False) else 0
+            data: dict = {"gate_fire": torch.tensor([f], device=dev)}
+        else:
+            data = {}
+        bcast = pp.broadcast_tensor_dict(data, src=pp.world_size - 1)
+        if bcast is None or not bool(bcast["gate_fire"].item()):
+            return
+        # Make sure the first-pass async send has landed before the 2nd pass
+        # reuses buffers / sends again.
+        if self._pp_send_work:
+            for handle in self._pp_send_work:
+                handle.wait()
+            self._pp_send_work = []
+        self.model_runner.gate_reforward()
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:
         return self.model_runner.take_draft_token_ids()

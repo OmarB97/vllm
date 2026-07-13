@@ -122,6 +122,15 @@ def register_model_loader(load_format: str):
 def get_model_loader(load_config: LoadConfig) -> BaseModelLoader:
     """Get a model loader based on the load format."""
     load_format = load_config.load_format
+    from vllm.model_executor.layers.quantization.utils import moe_w2_store
+
+    guarded_formats = {"auto", "hf", "mistral", "safetensors"}
+    if (moe_w2_store.checkpoint_cache_safety_enabled()
+            and load_format not in guarded_formats):
+        raise RuntimeError(
+            f"load format {load_format!r} bypasses the W2 pack-store "
+            "checkpoint cache-safety hooks; use one of "
+            f"{sorted(guarded_formats)} with sequential safetensors")
     if load_format not in _LOAD_FORMAT_TO_MODEL_LOADER:
         raise ValueError(f"Load format `{load_format}` is not supported")
     return _LOAD_FORMAT_TO_MODEL_LOADER[load_format](load_config)

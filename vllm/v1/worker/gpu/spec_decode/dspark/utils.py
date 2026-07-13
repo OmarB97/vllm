@@ -18,8 +18,20 @@ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
 
     # DSpark uses non-causal attention.
     causal = False
+    # The target's sparse-MLA layers promote the shared cache_config dtype to
+    # the packed "fp8_ds_mla" format, which no dense attention backend
+    # supports. Dense drafters (Qwen3-style DSpark heads) get a config with
+    # the dtype normalized back to plain fp8.
+    cache_config = vllm_config.cache_config
+    if (
+        cache_config is not None
+        and cache_config.cache_dtype == "fp8_ds_mla"
+        and "DSparkDraftModel" not in (draft_model_config.architectures or [])
+    ):
+        cache_config = replace(cache_config, cache_dtype="fp8")
     draft_vllm_config = replace(
         vllm_config,
+        cache_config=cache_config,
         attention_config=replace(
             vllm_config.attention_config,
             use_non_causal=not causal,

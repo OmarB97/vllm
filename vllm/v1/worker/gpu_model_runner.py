@@ -4,6 +4,7 @@
 import functools
 import gc
 import itertools
+import os
 import threading
 import time
 from collections import defaultdict
@@ -21,6 +22,14 @@ import torch.nn as nn
 from tqdm import tqdm
 
 import vllm.envs as envs
+
+# VLLM_MOE_W2 confidence gate (opt-in FP4 re-forward for low-confidence decode
+# tokens). Guarded so serving still boots if only part of the moe_w2 stack is
+# deployed; None => no gate, prod path unchanged.
+try:
+    from vllm.model_executor.layers.quantization.utils import moe_w2_gate
+except Exception:  # noqa: BLE001
+    moe_w2_gate = None
 from vllm.compilation.breakable_cudagraph import (
     BreakableCUDAGraphWrapper,
     is_breakable_cudagraph_enabled,
@@ -236,6 +245,14 @@ if TYPE_CHECKING:
     from vllm.v1.worker.encoder_cudagraph import EncoderCudaGraphManager
 
 logger = init_logger(__name__)
+
+
+def _batch_has_prefill(
+    num_computed_tokens: np.ndarray, num_prompt_tokens: np.ndarray
+) -> bool:
+    """Return whether any scheduled request is still consuming its prompt."""
+    return bool(np.any(num_computed_tokens < num_prompt_tokens))
+
 
 AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 # list when ubatching is enabled
@@ -923,6 +940,12 @@ class GPUModelRunner(
         # Ephemeral state transferred between execute_model() and sample_tokens().
         self.execute_model_state: ExecuteModelState | None = None
         self.kv_connector_output: KVConnectorOutput | None = None
+        # Confidence-gate (moe_w2) PP support: the full re-forward under PP is a
+        # collective driven by the WORKER (every rank must replay its stage), so
+        # execute_model caches this step's forward context + the last rank's
+        # fire decision here. TP/single-GPU re-forwards inline instead.
+        self._gate_ctx: dict | None = None
+        self._gate_fire: bool = False
         self.mamba_state_idx: dict[str, int] = {}
         self._mamba_bufs: mamba_utils.MambaBuffers | None = None
         self.mamba_prev_last_scheduled_idx: CpuGpuBuffer | None = None
@@ -1380,10 +1403,19 @@ class GPUModelRunner(
                         req_state.output_token_ids.extend(
                             new_token_ids[-num_new_tokens:]
                         )
-            elif num_output_tokens < len(req_state.output_token_ids):
-                # Some output tokens were discarded due to a sync-KV-load
-                # failure, or output_token_ids was inflated by the optimistic
-                # extend above (async spec decode). Align the cached state.
+            # Trim any optimistic over-extend back to the authoritative
+            # scheduler count. On the last rank this also handles tokens
+            # discarded by a sync-KV-load failure. On non-last PP ranks (async
+            # spec decode) it undoes the optimistic extend above + the
+            # _pp_receive placeholder append, which are otherwise NEVER
+            # corrected there (the deferred correction is not applied on
+            # non-last ranks) -- left uncorrected, output_token_ids grows
+            # ~num_spec faster than num_computed every step, inflating
+            # num_tokens until the discard mask trips and the request is
+            # dropped from prev_req_id_to_index (-> stale [-1,...] input ->
+            # embedding assert). Runs on all ranks; it is a no-op (len already
+            # == count) in the non-async / non-spec paths.
+            if num_output_tokens < len(req_state.output_token_ids):
                 del req_state.output_token_ids[num_output_tokens:]
                 if req_index is not None:
                     end_idx = (
@@ -2521,8 +2553,11 @@ class GPUModelRunner(
                 cm.slot_mapping = slot_mappings[kv_cache_gid]
 
             if self.speculative_config and spec_decode_common_attn_metadata is None:
+                # The drafter only exists on the last PP rank; other ranks
+                # fall through to the non-eagle branch.
+                _drafter = getattr(self, "drafter", None)
                 if isinstance(
-                    self.drafter,
+                    _drafter,
                     (
                         EagleProposer,
                         DFlashProposer,
@@ -2530,16 +2565,20 @@ class GPUModelRunner(
                         ExtractHiddenStatesProposer,
                     ),
                 ):
-                    if self.drafter.kv_cache_gid == kv_cache_gid:
+                    if _drafter.kv_cache_gid == kv_cache_gid:
                         spec_decode_common_attn_metadata = cm
                 else:
                     spec_decode_common_attn_metadata = cm
             # Capture per-group block tables for multi-group proposers.
-            if self.speculative_config and isinstance(self.drafter, Step3p5MTPProposer):
+            if self.speculative_config and isinstance(
+                getattr(self, "drafter", None), Step3p5MTPProposer
+            ):
                 self.drafter.set_per_group_attn_metadata(
                     kv_cache_gid, cm.block_table_tensor, cm.slot_mapping
                 )
-            elif self.speculative_config and isinstance(self.drafter, Gemma4Proposer):
+            elif self.speculative_config and isinstance(
+                getattr(self, "drafter", None), Gemma4Proposer
+            ):
                 self.drafter.set_per_group_block_table(
                     kv_cache_gid, cm.block_table_tensor
                 )
@@ -3574,6 +3613,18 @@ class GPUModelRunner(
             intermediate_tensors = self.sync_and_gather_intermediate_tensors(
                 num_input_tokens, intermediate_tensors, True
             )
+            # Zero the padding rows (beyond the real scheduled tokens) of the
+            # received hidden states, mirroring the positions zeroing above.
+            # Under FULL cudagraph the graph is captured for the padded size
+            # and reads these rows; if they hold stale/non-deterministic data
+            # (the PP transfer copies the padded extent), row-coupled kernels
+            # can leak them into the real tokens' output -> non-deterministic
+            # decode on non-first PP ranks. Zeroing makes the captured input
+            # deterministic.
+            if num_input_tokens > num_scheduled_tokens:
+                assert self.intermediate_tensors is not None
+                for _k, _t in self.intermediate_tensors.items():
+                    _t[num_scheduled_tokens:num_input_tokens].zero_()
 
         if is_encoder_decoder and scheduler_output.scheduled_encoder_inputs:
             # Run the encoder, just like we do with other multimodal inputs.
@@ -3992,6 +4043,7 @@ class GPUModelRunner(
     ) -> tuple[
         dict[int, torch.Tensor] | None,
         dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None,
+        torch.Tensor | list[torch.Tensor] | None,
     ]:
         """
         Build slot mappings in both formats needed by the system.
@@ -4006,13 +4058,40 @@ class GPUModelRunner(
             A tuple of:
             - slot_mappings_by_gid: dict[int, torch.Tensor] for attention metadata
             - slot_mappings_by_layer: dict[str, torch.Tensor] or list for ForwardContext
+            - token_slot_mapping: persistent FullAttention mapping, optionally sliced
         """
         if not (
             hasattr(self, "kv_cache_config")
             and self.kv_cache_config is not None
             and len(self.kv_cache_config.kv_cache_groups) > 0
         ):
-            return None, None
+            if os.getenv("VLLM_MOE_W2", "0") != "1":
+                return None, None, None
+            # Memory profiling runs a real W2 dummy forward before KV caches
+            # (and therefore attention slot mappings) exist. Give that phase
+            # the same fixed-address validity contract using runner-owned
+            # storage; graph capture after cache initialization uses the real
+            # FullAttention slot mapping below.
+            profile_storage = getattr(self, "_w2_profile_token_slot_mapping", None)
+            if profile_storage is None:
+                if torch.cuda.is_current_stream_capturing():
+                    raise RuntimeError(
+                        "cannot allocate the moe_w2 profile token mask during capture"
+                    )
+                profile_storage = torch.empty(
+                    (self.max_num_tokens,), dtype=torch.int64, device=self.device
+                )
+                self._w2_profile_token_slot_mapping = profile_storage
+            profile_mapping = profile_storage[:num_tokens_padded]
+            profile_mapping[:num_tokens_unpadded].zero_()
+            profile_mapping[num_tokens_unpadded:num_tokens_padded].fill_(-1)
+            if ubatch_slices is not None:
+                return (
+                    None,
+                    None,
+                    [profile_mapping[ubatch.token_slice] for ubatch in ubatch_slices],
+                )
+            return None, None, profile_mapping
 
         def _get_slot_mapping(kv_cache_gid: int):
             assert num_reqs_padded is not None and num_tokens_padded is not None
@@ -4039,6 +4118,14 @@ class GPUModelRunner(
             gid: _get_slot_mapping(gid)
             for gid, _ in enumerate(self.kv_cache_config.kv_cache_groups)
         }
+        if (
+            os.getenv("VLLM_MOE_W2", "0") == "1"
+            and self.parallel_config.decode_context_parallel_size != 1
+        ):
+            raise RuntimeError(
+                "moe_w2 padded-route masking requires decode context parallel size 1"
+            )
+        token_slot_mapping = slot_mappings_by_gid[self._get_attention_kv_cache_gid()]
 
         slot_mappings_by_layer: dict[str, torch.Tensor] = {}
         for gid, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups):
@@ -4048,14 +4135,16 @@ class GPUModelRunner(
 
         if ubatch_slices is not None:
             result: list[dict[str, torch.Tensor]] = []
+            token_result: list[torch.Tensor] = []
             for ubatch in ubatch_slices:
                 sliced_mappings: dict[str, torch.Tensor] = {}
                 for layer_name, slot_mapping in slot_mappings_by_layer.items():
                     sliced_mappings[layer_name] = slot_mapping[ubatch.token_slice]
                 result.append(sliced_mappings)
-            return slot_mappings_by_gid, result
+                token_result.append(token_slot_mapping[ubatch.token_slice])
+            return slot_mappings_by_gid, result, token_result
 
-        return slot_mappings_by_gid, slot_mappings_by_layer
+        return slot_mappings_by_gid, slot_mappings_by_layer, token_slot_mapping
 
     def _is_all_reqs_chunked_prefill(self) -> bool:
         """Check if all scheduled requests are marked to discard sampled tokens.
@@ -4150,6 +4239,15 @@ class GPUModelRunner(
             num_scheduled_tokens_np = np.array(tokens, dtype=np.int32)
             max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())
             num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
+            has_prefill = _batch_has_prefill(
+                self.input_batch.num_computed_tokens_cpu[:num_reqs],
+                self.input_batch.num_prompt_tokens[:num_reqs],
+            )
+            force_w2_prefill_eager = (
+                os.getenv("VLLM_MOE_W2", "0") == "1"
+                and not self.is_pooling_model
+                and has_prefill
+            )
 
             logits_indices, spec_decode_metadata = self._prepare_inputs(
                 scheduler_output,
@@ -4178,8 +4276,12 @@ class GPUModelRunner(
                 num_scheduled_tokens_np=num_scheduled_tokens_np,
                 max_num_scheduled_tokens=max_num_scheduled_tokens,
                 use_cascade_attn=cascade_attn_prefix_lens is not None,
+                force_eager=force_w2_prefill_eager,
                 num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
             )
+
+            if force_w2_prefill_eager and cudagraph_mode != CUDAGraphMode.NONE:
+                raise RuntimeError("moe_w2 prefill must execute without CUDA graphs")
 
             logger.debug(
                 "Running batch with cudagraph_mode: %s, batch_descriptor: %s, "
@@ -4267,15 +4369,19 @@ class GPUModelRunner(
             use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
             ubatch_slices_attn = ubatch_slices_padded if pad_attn else ubatch_slices
 
-            slot_mappings_by_group, slot_mappings = self._get_slot_mappings(
-                num_tokens_padded=num_tokens_padded
-                if pad_attn or has_separate_kv_update
-                else num_tokens_unpadded,
-                num_reqs_padded=(
-                    num_reqs_padded if pad_attn or has_separate_kv_update else num_reqs
-                ),
-                num_tokens_unpadded=num_tokens_unpadded,
-                ubatch_slices=ubatch_slices_padded,
+            slot_mappings_by_group, slot_mappings, token_slot_mapping = (
+                self._get_slot_mappings(
+                    num_tokens_padded=num_tokens_padded
+                    if pad_attn or has_separate_kv_update
+                    else num_tokens_unpadded,
+                    num_reqs_padded=(
+                        num_reqs_padded
+                        if pad_attn or has_separate_kv_update
+                        else num_reqs
+                    ),
+                    num_tokens_unpadded=num_tokens_unpadded,
+                    ubatch_slices=ubatch_slices_padded,
+                )
             )
 
             attn_metadata, spec_decode_common_attn_metadata = (
@@ -4320,6 +4426,45 @@ class GPUModelRunner(
             self.model_config.is_encoder_decoder and num_encoder_reqs > 0
         )
 
+        # CUDA graph capture/warmup and the previous target can leave routing
+        # marks in the tier singletons. Clear both tiers before the next target
+        # forward so its replay snapshot contains only this logical step. Keep
+        # prior-step pins until the target completes: they protect slots from a
+        # racing background manager while a graph or eager prefill starts.
+        if os.getenv("VLLM_MOE_W2", "0") == "1" and not self.is_pooling_model:
+            from vllm.model_executor.layers.quantization.utils import (
+                moe_w2_delta as _w2d,
+            )
+
+            _w2d.begin_target_step()
+
+        # moe_w2 draft-affinity PREFETCH (VLLM_MOE_W2_PREFETCH=1): before the
+        # forward, fold the PREVIOUS step's in-graph routing log into the
+        # token->experts table and prefetch this step's predicted experts on
+        # the tier's side stream. Under MTP this step's input ids ARE last
+        # step's sampled+draft tokens — the draft signal. Decode-shaped
+        # steps only (a prefill chunk would poison the table; prefill
+        # prefetches via ensure_resident anyway).
+        if moe_w2_gate is not None and not self.is_pooling_model and not has_prefill:
+            try:
+                from vllm.model_executor.layers.quantization.utils import (
+                    moe_w2_delta as _w2d,
+                )
+
+                _btier = _w2d._BASE_TIER
+                if (
+                    _btier is not None
+                    and _btier.route_log is not None
+                    and max_num_scheduled_tokens <= 4
+                ):
+                    _n_real = min(
+                        scheduler_output.total_num_scheduled_tokens,
+                        _btier.route_log.shape[1],
+                    )
+                    _btier.draft_prefetch(input_ids[:_n_real])
+            except Exception as e:  # noqa: BLE001 - never crash serving
+                logger.warning_once("moe_w2 draft prefetch skipped: %s", e)
+
         # Run the model.
         # Use persistent buffers for CUDA graphs.
         # When spec decode is enabled, defer connector finalization
@@ -4342,6 +4487,8 @@ class GPUModelRunner(
                 batch_descriptor=batch_desc,
                 ubatch_slices=ubatch_slices_padded,
                 slot_mapping=slot_mappings,
+                token_slot_mapping=token_slot_mapping,
+                has_prefill=has_prefill,
                 skip_compiled=has_encoder_input,
             ),
             record_function_or_nullcontext("gpu_model_runner: forward"),
@@ -4356,6 +4503,157 @@ class GPUModelRunner(
                 intermediate_tensors=intermediate_tensors,
                 inputs_embeds=inputs_embeds,
                 **model_kwargs,
+            )
+
+        # Open both tiers' pin scopes exactly once after the target pass and
+        # before any fixed-point or confidence-gated replay can promote experts.
+        if os.getenv("VLLM_MOE_W2", "0") == "1" and not self.is_pooling_model:
+            # This is a quality invariant, not a best-effort optimization. If
+            # the scope cannot be opened, continuing would silently preserve
+            # stale pins and eventually freeze a saturated pool.
+            from vllm.model_executor.layers.quantization.utils import (
+                moe_w2_delta as _w2d,
+            )
+
+            _w2d.begin_replay_step()
+
+        # moe_w2 BASE cache under PIPELINE parallelism: a miss is LOCAL to the
+        # stage — its desc kernels zeroed the missing pairs' contributions and
+        # bumped ITS miss counter, and the stage still holds this step's
+        # inputs (static graph buffers / intermediate_tensors). Correctness
+        # therefore needs only a SEGMENT re-run before the activations are
+        # consumed downstream — ~1/pp_size of a forward, unlike the gate's
+        # full-pipeline replay (the gate's signal, confidence, exists only at
+        # the logits; the base's signal is per-stage). No PP collective: each
+        # stage fixes its own segment; TP ranks WITHIN a stage decide via
+        # MAX-reduce and replay together (the segment contains TP
+        # collectives). Downstream stages never see the zeroed activations,
+        # so no cross-stage coordination is needed. KV rewrites in the replay
+        # are idempotent (same slot mapping, corrected values) — this covers
+        # MTP verify steps too, same as the inline TP path. PP==1 keeps the
+        # post-logits path below (unchanged).
+        if (
+            moe_w2_gate is not None
+            and get_pp_group().world_size > 1
+            and not self.is_pooling_model
+        ):
+            try:
+                from vllm.model_executor.layers.quantization.utils import (
+                    moe_w2_delta as _w2d,
+                )
+
+                _btier = _w2d._BASE_TIER
+                if _btier is not None:
+                    _miss = int(_btier.miss_count.item())
+                    _tp = get_tp_group()
+                    if _tp.world_size > 1:
+                        _t = torch.tensor([_miss], device=_btier.dev)
+                        torch.distributed.all_reduce(
+                            _t,
+                            op=torch.distributed.ReduceOp.MAX,
+                            group=_tp.device_group,
+                        )
+                        _max_miss = int(_t.item())
+                    else:
+                        _max_miss = _miss
+                    if _miss > 0:
+                        _btier.force_promote(
+                            max_promote=None,
+                            pin=_w2d.fp_continue(0, _max_miss),
+                        )
+                    _btier.kpi_step(_max_miss, _max_miss > _w2d.base_miss_tol())
+                    # Replay to a FIXED POINT (bounded): the corrected early
+                    # layers can re-route later layers to experts the first
+                    # pass never fetched — those SECOND-ORDER misses zero
+                    # contributions inside the replay itself, making logits
+                    # depend on pool content (measured as cross-request
+                    # greedy nondeterminism). Re-read the counter after each
+                    # replay; fetch + replay again until miss-free (typically
+                    # converges in one extra pass).
+                    _replays = 0
+                    while _w2d.fp_continue(_replays, _max_miss):
+                        _replays += 1
+                        with set_forward_context(
+                            attn_metadata,
+                            self.vllm_config,
+                            num_tokens=num_tokens_padded,
+                            num_tokens_across_dp=num_tokens_across_dp,
+                            cudagraph_runtime_mode=cudagraph_mode,
+                            batch_descriptor=batch_desc,
+                            ubatch_slices=ubatch_slices_padded,
+                            slot_mapping=slot_mappings,
+                            token_slot_mapping=token_slot_mapping,
+                            has_prefill=has_prefill,
+                            skip_compiled=has_encoder_input,
+                        ):
+                            model_output = self._model_forward(
+                                input_ids=input_ids,
+                                positions=positions,
+                                intermediate_tensors=intermediate_tensors,
+                                inputs_embeds=inputs_embeds,
+                                **model_kwargs,
+                            )
+                        _miss = int(_btier.miss_count.item())
+                        if _tp.world_size > 1:
+                            _t = torch.tensor([_miss], device=_btier.dev)
+                            torch.distributed.all_reduce(
+                                _t,
+                                op=torch.distributed.ReduceOp.MAX,
+                                group=_tp.device_group,
+                            )
+                            _max_miss = int(_t.item())
+                        else:
+                            _max_miss = _miss
+                        if _miss > 0:
+                            _btier.force_promote(
+                                max_promote=None,
+                                pin=_w2d.fp_continue(_replays, _max_miss),
+                            )
+                    if _replays:
+                        _btier.kpi_fp(_replays, _max_miss)
+            except Exception as e:  # noqa: BLE001 - never crash serving
+                logger.warning("moe_w2 base-cache PP stage replay skipped: %s", e)
+
+        # moe_w2 confidence gate under PP: cache this step's forward context so
+        # the worker can drive a FULL second pipeline pass (gate_reforward) when
+        # the last rank flags low confidence. A partial last-stage-only inline
+        # re-forward (the only thing reachable on the last rank alone) corrupts
+        # output, so under PP every rank must replay its stage. Bounded to
+        # gate+PP; TP/single re-forwards inline below. Stored BEFORE the
+        # non-last early-return so all ranks have it. ARMED only on PURE-DECODE
+        # steps (spec/MTP verify re-run is not idempotent under PP); the
+        # condition is identical on every PP rank (spec_decode_metadata + token
+        # counts come from the shared scheduler output), so the worker can
+        # decide to run the barrier collective purely from `_gate_ctx is not
+        # None` without another collective.
+        self._gate_fire = False
+        self._gate_ctx = None
+        if (
+            moe_w2_gate is not None
+            and moe_w2_gate.enabled()
+            and get_pp_group().world_size > 1
+            and not self.is_pooling_model
+            and not has_prefill
+            and spec_decode_metadata is None
+            and max_num_scheduled_tokens <= 1
+        ):
+            self._gate_ctx = dict(
+                input_ids=input_ids,
+                positions=positions,
+                intermediate_tensors=intermediate_tensors,
+                inputs_embeds=inputs_embeds,
+                model_kwargs=model_kwargs,
+                attn_metadata=attn_metadata,
+                num_tokens_padded=num_tokens_padded,
+                num_tokens_across_dp=num_tokens_across_dp,
+                cudagraph_mode=cudagraph_mode,
+                batch_desc=batch_desc,
+                ubatch_slices_padded=ubatch_slices_padded,
+                slot_mappings=slot_mappings,
+                token_slot_mapping=token_slot_mapping,
+                has_prefill=has_prefill,
+                has_encoder_input=has_encoder_input,
+                logits_indices=logits_indices,
             )
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
@@ -4416,6 +4714,202 @@ class GPUModelRunner(
                 assert broadcasted is not None
                 logits = broadcasted["logits"]
 
+        # moe_w2 BASE cache (VLLM_MOE_W2_BASE_CACHE_GB>0): the 2-bit base is
+        # host-resident and the GPU pool may MISS routed experts — the desc
+        # kernel zeroed their contributions and bumped the tier's miss
+        # counter. Fetch the missing experts synchronously and replay the
+        # step's graph ONCE (mandatory for correctness, unlike the optional
+        # gate re-forward below). TP-only: all ranks decide via OR-reduce and
+        # replay together (the re-forward is a collective). Fail-safe: on any
+        # error the zero-contribution logits are kept (quality blip, not a
+        # crash).
+        if (
+            moe_w2_gate is not None  # module family deployed
+            and logits is not None
+            and not self.is_pooling_model
+            and get_pp_group().world_size == 1
+        ):
+            try:
+                from vllm.model_executor.layers.quantization.utils import (
+                    moe_w2_delta as _w2d,
+                )
+
+                _btier = _w2d._BASE_TIER
+                if _btier is not None:
+                    _miss = int(_btier.miss_count.item())
+                    _tp = get_tp_group()
+                    if _tp.world_size > 1:
+                        _t = torch.tensor([_miss], device=logits.device)
+                        torch.distributed.all_reduce(
+                            _t,
+                            op=torch.distributed.ReduceOp.MAX,
+                            group=_tp.device_group,
+                        )
+                        _max_miss = int(_t.item())
+                    else:
+                        _max_miss = _miss
+                    # Fetch this rank's missing experts whenever it has any
+                    # (they join the pool for future steps); replay only when
+                    # the worst rank exceeds the tolerance — the same reduced
+                    # max on every rank, so the collective replay stays in
+                    # lockstep. Tolerated steps keep their logits: <= TOL of
+                    # the step's ~top_k*n_layers weighted contributions were
+                    # zeroed (bounded approximation, delta/gate class).
+                    if _miss > 0:
+                        _btier.force_promote(
+                            max_promote=None,
+                            pin=_w2d.fp_continue(0, _max_miss),
+                        )
+                    # KPI: per-step replay rate + missing pairs (windowed
+                    # INFO line) — the pool-sizing signal.
+                    _btier.kpi_step(_max_miss, _max_miss > _w2d.base_miss_tol())
+                    # Replay to a FIXED POINT (bounded): corrected early
+                    # layers can re-route later layers onto experts the
+                    # first pass never fetched; those second-order misses
+                    # zero contributions inside the replay itself and made
+                    # greedy output depend on pool content (cross-request
+                    # nondeterminism). Re-read the counter after each
+                    # replay; fetch + replay until miss-free (typically one
+                    # extra pass).
+                    _replays = 0
+                    while _w2d.fp_continue(_replays, _max_miss):
+                        _replays += 1
+                        with set_forward_context(
+                            attn_metadata,
+                            self.vllm_config,
+                            num_tokens=num_tokens_padded,
+                            num_tokens_across_dp=num_tokens_across_dp,
+                            cudagraph_runtime_mode=cudagraph_mode,
+                            batch_descriptor=batch_desc,
+                            ubatch_slices=ubatch_slices_padded,
+                            slot_mapping=slot_mappings,
+                            token_slot_mapping=token_slot_mapping,
+                            has_prefill=has_prefill,
+                            skip_compiled=has_encoder_input,
+                        ):
+                            _re_out = self._model_forward(
+                                input_ids=input_ids,
+                                positions=positions,
+                                intermediate_tensors=intermediate_tensors,
+                                inputs_embeds=inputs_embeds,
+                                **model_kwargs,
+                            )
+                        if self.use_aux_hidden_state_outputs:
+                            hidden_states, aux_hidden_states = _re_out
+                        else:
+                            hidden_states = _re_out
+                        sample_hidden_states = hidden_states[logits_indices]
+                        logits = self.model.compute_logits(sample_hidden_states)
+                        _miss = int(_btier.miss_count.item())
+                        if _tp.world_size > 1:
+                            _t = torch.tensor([_miss], device=logits.device)
+                            torch.distributed.all_reduce(
+                                _t,
+                                op=torch.distributed.ReduceOp.MAX,
+                                group=_tp.device_group,
+                            )
+                            _max_miss = int(_t.item())
+                        else:
+                            _max_miss = _miss
+                        if _miss > 0:
+                            _btier.force_promote(
+                                max_promote=None,
+                                pin=_w2d.fp_continue(_replays, _max_miss),
+                            )
+                    if _replays:
+                        _btier.kpi_fp(_replays, _max_miss)
+            except Exception as e:  # noqa: BLE001 - never crash serving
+                logger.warning("moe_w2 base-cache miss replay skipped: %s", e)
+
+        # Confidence-gated FP4 re-forward (VLLM_MOE_W2_GATE=1; default OFF, so
+        # the serving path is byte-for-byte unchanged). When this step's 2-bit
+        # top-1 is low-confidence, pull its routed COLD experts up to FP4
+        # (force_promote) and replay the graph ONCE so the step is re-decided
+        # at FP4. Fires on real DECODE: a SPEC-DECODE verify step (MTP on) OR a
+        # pure single-token decode (MTP off); prefill is excluded (it has
+        # spec_decode_metadata None AND many scheduled tokens). Under MTP
+        # `logits` covers the base+draft positions; should_reforward fires if
+        # ANY is low-conf, the replay recomputes ALL of them at FP4, and the
+        # downstream draft verification then accepts against the FP4 target.
+        # Last PP rank only. Fail-safe: any error keeps the 2-bit logits.
+        if (
+            moe_w2_gate is not None
+            and moe_w2_gate.enabled()
+            and logits is not None
+            and not self.is_pooling_model
+            and not has_prefill
+            and get_pp_group().is_last_rank
+            and (spec_decode_metadata is not None or max_num_scheduled_tokens <= 1)
+        ):
+            try:
+                # The re-forward is a COLLECTIVE (TP: all-reduce per layer; PP:
+                # a full pipeline pass), so all participating ranks must replay
+                # together or it desyncs/hangs, and a PARTIAL (last-stage-only)
+                # replay corrupts output.
+                #   - PP (world_size>1): only RECORD the decision here; the
+                #     worker broadcasts it and drives gate_reforward() on EVERY
+                #     rank. MTP+PP stays fail-safed to the 2-bit logits (the
+                #     sparse-MLA verify re-run is not idempotent).
+                #   - TP / single GPU: re-forward INLINE. OR-reduce `fire`
+                #     across TP so every rank agrees (logits are replicated
+                #     post lm_head all-gather).
+                if get_pp_group().world_size > 1:
+                    self._gate_fire = (
+                        spec_decode_metadata is None
+                        and moe_w2_gate.should_reforward(logits)
+                        and moe_w2_gate.reforward_enabled()
+                    )
+                else:
+                    fire = moe_w2_gate.should_reforward(logits)
+                    _tp = get_tp_group()
+
+                    def _or_tp(flag: bool) -> bool:
+                        if _tp.world_size <= 1:
+                            return flag
+                        t = torch.tensor([1 if flag else 0], device=logits.device)
+                        torch.distributed.all_reduce(
+                            t, op=torch.distributed.ReduceOp.MAX, group=_tp.device_group
+                        )
+                        return bool(t.item())
+
+                    fire = _or_tp(fire)
+                    if fire:
+                        # Promote this rank's COLD routed experts (per-rank
+                        # shard side effect, never a per-rank replay gate).
+                        n_promoted = moe_w2_gate.force_promote_step()
+                        # Replay only if SOME rank upgraded a cold expert ->
+                        # the result can actually change; if everything routed
+                        # was already FP4 the replay is wasted HBM bandwidth.
+                        if _or_tp(n_promoted > 0) and moe_w2_gate.reforward_enabled():
+                            with set_forward_context(
+                                attn_metadata,
+                                self.vllm_config,
+                                num_tokens=num_tokens_padded,
+                                num_tokens_across_dp=num_tokens_across_dp,
+                                cudagraph_runtime_mode=cudagraph_mode,
+                                batch_descriptor=batch_desc,
+                                ubatch_slices=ubatch_slices_padded,
+                                slot_mapping=slot_mappings,
+                                token_slot_mapping=token_slot_mapping,
+                                has_prefill=has_prefill,
+                                skip_compiled=has_encoder_input,
+                            ):
+                                regated_output = self._model_forward(
+                                    input_ids=input_ids,
+                                    positions=positions,
+                                    intermediate_tensors=intermediate_tensors,
+                                    inputs_embeds=inputs_embeds,
+                                    **model_kwargs,
+                                )
+                            if self.use_aux_hidden_state_outputs:
+                                hidden_states, aux_hidden_states = regated_output
+                            else:
+                                hidden_states = regated_output
+                            sample_hidden_states = hidden_states[logits_indices]
+                            logits = self.model.compute_logits(sample_hidden_states)
+            except Exception as e:  # noqa: BLE001 - gate must never crash serving
+                logger.warning("moe_w2 confidence gate re-forward skipped: %s", e)
+
         self.execute_model_state = ExecuteModelState(
             scheduler_output,
             logits,
@@ -4436,6 +4930,101 @@ class GPUModelRunner(
             deferred_state_corrections_fn()
 
         return None
+
+    @torch.inference_mode
+    def gate_reforward(self) -> None:
+        """Full-pipeline FP4 re-forward for the confidence gate under PP.
+
+        Driven by the worker AFTER it has broadcast the last rank's `fire`
+        decision (so all ranks agree). Every rank re-runs ITS stage at FP4
+        using the forward context cached by execute_model(): a non-first rank
+        receives the upgraded activation from the previous stage, runs its
+        layers (with its routed experts force-promoted to FP4), and a non-last
+        rank sends the result onward; the last rank recomputes logits and
+        overwrites execute_model_state for sample_tokens(). This is the PP
+        analogue of the inline TP/single-GPU re-forward and the only correct
+        way to re-decide under PP (a last-stage-only replay corrupts output).
+        Fail-safe: on any error the 2-bit logits already stored in
+        execute_model_state are kept.
+        """
+        ctx = self._gate_ctx
+        self._gate_ctx = None
+        if ctx is None or moe_w2_gate is None:
+            return
+        pp = get_pp_group()
+        tp = get_tp_group()
+        # Only the LAST rank carries execute_model_state (non-last ranks
+        # returned their intermediate tensors early in execute_model and never
+        # set it). They still MUST replay their stage to keep the pipeline
+        # collective balanced.
+        if pp.is_last_rank and self.execute_model_state is None:
+            return
+        _trace = os.getenv("VLLM_MOE_W2_GATE_TRACE", "0") == "1"
+        try:
+            # Promote THIS stage's routed cold experts to FP4 (rank-local, no
+            # collective) so this stage's replay runs at FP4.
+            moe_w2_gate.force_promote_step()
+            intermediate = ctx["intermediate_tensors"]
+            if not pp.is_first_rank:
+                recv = pp.recv_tensor_dict(all_gather_group=tp)
+                intermediate = IntermediateTensors(recv)
+            with set_forward_context(
+                ctx["attn_metadata"],
+                self.vllm_config,
+                num_tokens=ctx["num_tokens_padded"],
+                num_tokens_across_dp=ctx["num_tokens_across_dp"],
+                cudagraph_runtime_mode=ctx["cudagraph_mode"],
+                batch_descriptor=ctx["batch_desc"],
+                ubatch_slices=ctx["ubatch_slices_padded"],
+                slot_mapping=ctx["slot_mappings"],
+                token_slot_mapping=ctx["token_slot_mapping"],
+                has_prefill=ctx["has_prefill"],
+                skip_compiled=ctx["has_encoder_input"],
+            ):
+                out = self._model_forward(
+                    input_ids=ctx["input_ids"],
+                    positions=ctx["positions"],
+                    intermediate_tensors=intermediate,
+                    inputs_embeds=ctx["inputs_embeds"],
+                    **ctx["model_kwargs"],
+                )
+            if self.use_aux_hidden_state_outputs:
+                hidden_states, aux_hidden_states = out
+            else:
+                hidden_states, aux_hidden_states = out, None
+            if not pp.is_last_rank:
+                # Forward the FP4-upgraded activation to the next stage's
+                # replay. Clone out of any cudagraph-pool aliasing before the
+                # send (mirrors the worker's first-pass send guard).
+                assert isinstance(hidden_states, IntermediateTensors)
+                send = {
+                    k: (v.clone() if v.is_cuda else v)
+                    for k, v in hidden_states.tensors.items()
+                }
+                pp.send_tensor_dict(send, all_gather_group=tp)
+                if _trace:
+                    logger.info(
+                        "[gate-pp] rank=%d replayed stage at FP4 -> sent",
+                        pp.rank_in_group,
+                    )
+            else:
+                sample_hidden_states = hidden_states[ctx["logits_indices"]]
+                new_logits = self.model.compute_logits(sample_hidden_states)
+                # Overwrite the cached (2-bit) state with the FP4 re-decided
+                # state so sample_tokens() / the MTP drafter run against FP4.
+                self.execute_model_state = self.execute_model_state._replace(
+                    logits=new_logits,
+                    hidden_states=hidden_states,
+                    sample_hidden_states=sample_hidden_states,
+                    aux_hidden_states=aux_hidden_states,
+                )
+                if _trace:
+                    logger.info(
+                        "[gate-pp] rank=%d (last) replayed -> FP4 logits",
+                        pp.rank_in_group,
+                    )
+        except Exception as e:  # noqa: BLE001 - gate must never crash serving
+            logger.warning("moe_w2 PP gate re-forward skipped: %s", e)
 
     def _input_fits_in_drafter(
         self, common_attn_metadata: CommonAttentionMetadata | None
@@ -4462,6 +5051,12 @@ class GPUModelRunner(
             # receive sampled token ids from the last PP rank.
             if self.use_async_scheduling and not get_pp_group().is_last_rank:
                 self._pp_receive_prev_sampled_token_ids_to_input_batch()
+                # Spec decode: also receive the drafts (the drafter only runs
+                # on the last rank). Order matters -- this must follow the
+                # sampled receive to match the broadcast order on the last
+                # rank.
+                if self.num_spec_tokens > 0:
+                    self._pp_receive_draft_token_ids()
             # In case of PP with kv transfer, we need to pass through the
             # kv_connector_output
             return ModelRunnerOutput.with_kv_conn_output_only(kv_connector_output)
@@ -4653,6 +5248,23 @@ class GPUModelRunner(
                 )
                 self.drafter.dummy_run(num_tokens=1)
 
+        # PP + async spec decode: the drafter ran only on this (last) rank,
+        # but the first rank embeds input_ids and needs the drafts to fill the
+        # spec positions. Broadcast them now (after they are proposed) so the
+        # next step's _prepare_input_ids scatters them into rank 0's input;
+        # otherwise rank 0 embeds stale tokens at the spec positions and every
+        # draft is rejected. Mirrors _pp_broadcast_prev_sampled_token_ids and
+        # must come after it to keep the device_group broadcasts ordered
+        # across ranks.
+        if (
+            self.use_async_scheduling
+            and not self.broadcast_pp_output
+            and self.num_spec_tokens > 0
+        ):
+            pp = get_pp_group()
+            if pp.world_size > 1 and pp.is_last_rank:
+                self._pp_broadcast_draft_token_ids()
+
         # Finalize KV connector (wait_for_save + clear metadata) after
         # draft model runs. Deferred from target model forward to allow
         # draft model to also save its KV cache.
@@ -4745,13 +5357,35 @@ class GPUModelRunner(
     def _pp_broadcast_prev_sampled_token_ids(
         self, sampled_token_ids: torch.Tensor
     ) -> None:
-        """Broadcast sampled token ids (GPU) from last PP stage"""
+        """Broadcast sampled token ids (GPU) from last PP stage.
+
+        For non-spec decode `sampled_token_ids` is [num_reqs, 1]. For
+        speculative decode it is [num_reqs, 1 + num_spec] with -1 in the
+        rejected tail; the next step's input needs the LAST ACCEPTED token per
+        request (the token the next forward must be conditioned on), so the
+        receiver reduces it to [num_reqs, 1]. This makes PP + async scheduling
+        work with MTP/spec decode (otherwise the prev accepted token is never
+        carried into the next step's input on non-last ranks).
+        """
         pp = get_pp_group()
         assert pp.is_last_rank
-        # `prev_sampled_token_ids` is expected to have shape [num_reqs, 1].
-        assert sampled_token_ids.dim() == 2 and sampled_token_ids.shape[-1] == 1, (
-            "PP+async expects sampled_token_ids to have shape [num_reqs, 1]"
-        )
+        assert sampled_token_ids.dim() == 2
+        # Broadcast a FIXED-width [num_reqs, 1 + num_spec] tensor (with -1 in
+        # the rejected tail) so the receiving ranks can recover both the last
+        # accepted token (for the next input) AND the per-request accepted
+        # count (for output-length bookkeeping). The sampled width varies by
+        # step (1 at prefill / no-draft, 1 + num_spec at spec decode), so pad
+        # to the fixed width the receivers allocate -- otherwise the
+        # collective sizes mismatch and the broadcast deadlocks.
+        sampled_token_ids = sampled_token_ids.to(torch.int32)
+        target_w = 1 + self.num_spec_tokens
+        if sampled_token_ids.shape[1] < target_w:
+            pad = sampled_token_ids.new_full(
+                (sampled_token_ids.shape[0], target_w - sampled_token_ids.shape[1]),
+                -1,
+            )
+            sampled_token_ids = torch.cat([sampled_token_ids, pad], dim=1)
+        sampled_token_ids = sampled_token_ids.contiguous()
         # Skip for chunked prefill: sampled tokens are dummy
         # and will be discarded, no need to broadcast.
         if not self._is_all_reqs_chunked_prefill():
@@ -4760,16 +5394,33 @@ class GPUModelRunner(
             )
 
     def _pp_receive_prev_sampled_token_ids_to_input_batch(self) -> None:
-        """Receive sampled token ids broadcast from last PP stage"""
+        """Receive sampled token ids broadcast from last PP stage.
+
+        Receives the full [num_reqs, 1 + num_spec] tensor (with -1 in the
+        rejected tail). For spec decode, reduces it to the LAST ACCEPTED token
+        per request (what the next input must be conditioned on) and advances
+        each request's local output length by its accepted count (not a fixed
+        1), so positions stay consistent across PP ranks.
+        """
         pp = get_pp_group()
         assert not pp.is_last_rank
         num_reqs = self.input_batch.num_reqs
-        # `prev_sampled_token_ids` is expected to have shape [num_reqs, 1].
-        recv = torch.empty((num_reqs, 1), dtype=torch.int32, device=self.device)
+        width = 1 + self.num_spec_tokens
+        recv = torch.empty((num_reqs, width), dtype=torch.int32, device=self.device)
         # skip for chunked prefill.
         if not self._is_all_reqs_chunked_prefill():
             torch.distributed.broadcast(recv, src=pp.last_rank, group=pp.device_group)
-        self.input_batch.prev_sampled_token_ids = recv
+
+        if width == 1:
+            counts_cpu = [1] * num_reqs
+            self.input_batch.prev_sampled_token_ids = recv
+        else:
+            # accepted count = number of non-(-1) entries per request (>= 1).
+            counts = (recv != -1).sum(dim=1)
+            last_idx = (counts - 1).clamp(min=0).unsqueeze(1)
+            last_tok = recv.gather(1, last_idx)  # [num_reqs, 1], last accepted
+            self.input_batch.prev_sampled_token_ids = last_tok
+            counts_cpu = counts.tolist()
 
         # construct `prev_req_id_to_index` here so `_prepare_input_ids`
         # can map req_id -> previous batch row
@@ -4780,18 +5431,157 @@ class GPUModelRunner(
             if i in discard_req_indices_set:
                 continue
             prev_req_id_to_index[req_id] = i
-            # PP+async scheduling: advance per-request local cached output length by
-            # appending a placeholder (-1) token id.
+            # PP+async scheduling: advance per-request local cached output
+            # length by appending one placeholder (-1) per accepted token this
+            # step.
             if (req_state := self.requests.get(req_id)) is not None:
-                req_state.output_token_ids.append(-1)
+                for _ in range(int(counts_cpu[i])):
+                    req_state.output_token_ids.append(-1)
             pos = self.input_batch.num_tokens_no_spec[i]
-            self.input_batch.is_token_ids[i, pos] = True
-            self.input_batch.num_tokens_no_spec[i] = pos + 1
+            end = pos + int(counts_cpu[i])
+            self.input_batch.is_token_ids[i, pos:end] = True
+            self.input_batch.num_tokens_no_spec[i] = end
         self.input_batch.prev_req_id_to_index = prev_req_id_to_index
+
+    def _pp_broadcast_draft_token_ids(self) -> None:
+        """Broadcast the just-proposed draft token ids (GPU) from the last PP
+        stage to all ranks.
+
+        Under PP the drafter (MTP/EAGLE) runs only on the last rank, but the
+        FIRST rank is the only rank that embeds ``input_ids`` -- so without
+        this it never sees the speculative tokens and embeds stale values at
+        the spec positions, yielding garbage hidden states and ~0% draft
+        acceptance. Broadcasting the drafts lets the next step's
+        ``_prepare_input_ids`` scatter them into rank 0's input exactly as the
+        co-located (TP / single-GPU) path does.
+
+        Paired with ``_pp_receive_draft_token_ids``. MUST be issued AFTER
+        ``_pp_broadcast_prev_sampled_token_ids`` so the two broadcasts on the
+        PP ``device_group`` stay in the same order on every rank.
+        """
+        pp = get_pp_group()
+        assert pp.is_last_rank
+        # Skip for chunked prefill (mirror the sampled-token broadcast): no
+        # drafts are consumed, and the other ranks skip the matching receive.
+        if self._is_all_reqs_chunked_prefill():
+            return
+        num_reqs = self.input_batch.num_reqs
+        width = self.num_spec_tokens
+        # Fixed [num_reqs, num_spec] shape the receivers allocate. Pad missing
+        # slots with 0 (a valid token id) rather than -1, so a shape mismatch
+        # can never trip the embedding bounds check on rank 0.
+        out = torch.zeros((num_reqs, width), dtype=torch.int32, device=self.device)
+        draft = self._draft_token_ids
+        if isinstance(draft, torch.Tensor) and draft.dim() == 2:
+            d = draft.to(torch.int32)
+            r = min(d.shape[0], num_reqs)
+            c = min(d.shape[1], width)
+            out[:r, :c] = d[:r, :c]
+        torch.distributed.broadcast(out, src=pp.rank, group=pp.device_group)
+
+    def _pp_receive_draft_token_ids(self) -> None:
+        """Receive the draft token ids broadcast from the last PP stage and
+        stash them in ``self._draft_token_ids`` so the next step's
+        ``_prepare_input_ids`` scatters them into rank 0's (the embedding
+        rank's) input at the spec positions. Paired with
+        ``_pp_broadcast_draft_token_ids``.
+        """
+        pp = get_pp_group()
+        assert not pp.is_last_rank
+        if self._is_all_reqs_chunked_prefill():
+            return
+        num_reqs = self.input_batch.num_reqs
+        width = self.num_spec_tokens
+        recv = torch.empty((num_reqs, width), dtype=torch.int32, device=self.device)
+        torch.distributed.broadcast(recv, src=pp.last_rank, group=pp.device_group)
+        self._draft_token_ids = recv
+
+    def _pp_share_draft_embed_tokens(self) -> None:
+        """Copy the target model's input embedding from the first PP rank into
+        the MTP drafter on the last PP rank (one-time, at load).
+
+        vLLM's `_maybe_share_embeddings` only shares the target embedding with
+        the draft when `pp_world_size == 1`. Under PP the target's
+        `embed_tokens` lives on the first rank while the drafter lives on the
+        last rank, so the share is skipped -- and DeepSeek-V4 checkpoints ship
+        no `mtp.*` embedding weight, so the drafter's `embed_tokens` is left
+        zero/uninitialized. The draft then embeds every token as garbage,
+        ignores the actual previous token and accepts ~0% of its drafts.
+        Broadcasting the embedding restores single-GPU acceptance.
+        """
+        pp = get_pp_group()
+        if pp.world_size <= 1:
+            return
+        # Locate the target embedding (only materialized on the first rank).
+        src_emb = None
+        if pp.is_first_rank:
+            inner = getattr(self.model, "model", None)
+            emb = getattr(inner, "embed_tokens", None)
+            src_emb = getattr(emb, "weight", None)
+        # Broadcast [rows, cols] first so every rank allocates a matching
+        # buffer.
+        shape_t = torch.zeros(2, dtype=torch.int64, device=self.device)
+        if src_emb is not None:
+            shape_t[0], shape_t[1] = src_emb.shape[0], src_emb.shape[1]
+        torch.distributed.broadcast(shape_t, src=pp.first_rank, group=pp.device_group)
+        rows, cols = int(shape_t[0].item()), int(shape_t[1].item())
+        if rows == 0 or cols == 0:
+            logger.warning(
+                "MTP+PP embed share: target embed_tokens not found; skipping "
+                "(draft acceptance will be degraded)."
+            )
+            return
+        dtype = self.model_config.dtype
+        if src_emb is not None:
+            buf = src_emb.detach().to(device=self.device, dtype=dtype).contiguous()
+        else:
+            buf = torch.empty((rows, cols), dtype=dtype, device=self.device)
+        torch.distributed.broadcast(buf, src=pp.first_rank, group=pp.device_group)
+        if pp.is_last_rank and hasattr(self, "drafter"):
+            draft_model = getattr(self.drafter, "model", None)
+            inner = getattr(draft_model, "model", None)
+            dst = getattr(inner, "embed_tokens", None)
+            dst_w = getattr(dst, "weight", None)
+            if dst_w is None:
+                logger.warning(
+                    "MTP+PP embed share: drafter embed_tokens missing; skipping."
+                )
+                return
+            if dst_w.shape != buf.shape:
+                logger.warning(
+                    "MTP+PP embed share: shape mismatch draft=%s target=%s; skip.",
+                    list(dst_w.shape),
+                    list(buf.shape),
+                )
+                return
+            dst_w.data.copy_(buf)
+            logger.info(
+                "MTP+PP: copied target embed_tokens -> drafter %s (abs=%.2f)",
+                list(buf.shape),
+                float(buf.float().abs().sum()),
+            )
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:
         if not self.num_spec_tokens or not self._draft_token_req_ids:
             return None
+        # moe_w2 spec-guard (VLLM_MOE_W2_SPEC_GUARD): while the base pool is
+        # cold (replay EMA above threshold), drop this step's drafts instead
+        # of scheduling them — a k-token verify batch unions ~(1+k)x the
+        # experts of a pure decode step, so speculation on a cold pool
+        # multiplies miss-replays and is a net loss until the pool warms
+        # (colibri's measured cold-cache MTP regression). The drafter still
+        # ran (cheap); only scheduling is suppressed, and it resumes
+        # automatically via the tier's hysteresis latch.
+        if moe_w2_gate is not None:
+            try:
+                from vllm.model_executor.layers.quantization.utils import (
+                    moe_w2_delta as _w2d,
+                )
+
+                if _w2d.spec_suppressed():
+                    return None
+            except Exception:  # noqa: BLE001 - guard must never crash
+                pass
         draft_token_ids, req_ids = self._get_draft_token_ids_cpu()
         return DraftTokenIds(req_ids, draft_token_ids)
 
@@ -5259,6 +6049,45 @@ class GPUModelRunner(
                         assert hasattr(self.drafter, "set_eplb_state")
                         self.drafter.set_eplb_state(self.eplb_state)
                         eplb_models += 1
+
+                # MTP + PP: the drafter's input embedding cannot be shared
+                # with the target (target embed_tokens is on the FIRST PP
+                # rank, the drafter on the LAST), and vLLM only shares
+                # embeddings when pp_world_size == 1 -> the drafter's
+                # embed_tokens stays zero/uninitialized (DeepSeek-V4
+                # checkpoints carry no mtp.* embedding), the draft embeds
+                # every token as garbage and accepts ~0% of its drafts.
+                # Broadcast the target embedding (first rank) into the drafter
+                # (last rank). Collective: every rank must reach this
+                # (config-gated).
+                if (
+                    self.speculative_config is not None
+                    and get_pp_group().world_size > 1
+                ):
+                    self._pp_share_draft_embed_tokens()
+
+                # moe_w2 LOOKA/PILOT (router-lookahead, env-gated): collect
+                # the live mlp.gate weights per built w2 layer and allocate
+                # the in-graph prediction buffers. Must run after weight
+                # load (gates materialized, _LAYERS populated) and before
+                # any cudagraph capture. No-op unless armed via env.
+                if moe_w2_gate is not None:
+                    try:
+                        from vllm.model_executor.layers.quantization.utils import (
+                            moe_w2_delta as _w2d,
+                        )
+                        from vllm.model_executor.layers.quantization.utils import (
+                            moe_w2_looka as _w2l,
+                        )
+
+                        if _w2d._BASE_TIER is not None:
+                            _w2l.arm(
+                                self.model,
+                                _w2d._BASE_TIER.n_layers,
+                                _w2d._BASE_TIER.dev,
+                            )
+                    except Exception as e:  # noqa: BLE001 - never fatal
+                        logger.warning("moe_w2 LOOKA arm failed: %s", e)
 
                 self._setup_eagle3_aux_hidden_state_outputs()
 
@@ -5874,11 +6703,13 @@ class GPUModelRunner(
 
         attn_metadata: PerLayerAttnMetadata | None = None
 
-        slot_mappings_by_group, slot_mappings = self._get_slot_mappings(
-            num_tokens_padded=num_tokens_padded,
-            num_reqs_padded=num_reqs_padded,
-            num_tokens_unpadded=num_tokens_unpadded,
-            ubatch_slices=ubatch_slices_padded,
+        slot_mappings_by_group, slot_mappings, token_slot_mapping = (
+            self._get_slot_mappings(
+                num_tokens_padded=num_tokens_padded,
+                num_reqs_padded=num_reqs_padded,
+                num_tokens_unpadded=num_tokens_unpadded,
+                ubatch_slices=ubatch_slices_padded,
+            )
         )
 
         # Dummy runs have no real slot assignments — fill with -1 so
@@ -6005,6 +6836,8 @@ class GPUModelRunner(
                     batch_descriptor=batch_desc,
                     ubatch_slices=ubatch_slices_padded,
                     slot_mapping=slot_mappings,
+                    token_slot_mapping=token_slot_mapping,
+                    has_prefill=None,
                 ),
             ):
                 outputs = self.model(
@@ -6020,10 +6853,15 @@ class GPUModelRunner(
             else:
                 hidden_states = outputs
 
-            if self.speculative_config and (
-                self.speculative_config.use_eagle()
-                or self.speculative_config.uses_draft_model()
-                or self.speculative_config.uses_extract_hidden_states()
+            # The drafter lives on the last PP rank only.
+            if (
+                self.speculative_config
+                and get_pp_group().is_last_rank
+                and (
+                    self.speculative_config.use_eagle()
+                    or self.speculative_config.uses_draft_model()
+                    or self.speculative_config.uses_extract_hidden_states()
+                )
             ):
                 assert isinstance(
                     self.drafter,
@@ -6926,10 +7764,15 @@ class GPUModelRunner(
         # because some of them change the threshold at init time.
         self.calculate_reorder_batch_threshold()
 
-        # Initialize drafter attention backend
-        if self.speculative_config and (
-            self.speculative_config.use_eagle()
-            or self.speculative_config.uses_draft_model()
+        # Initialize drafter attention backend (drafter lives on the last PP
+        # rank only).
+        if (
+            self.speculative_config
+            and get_pp_group().is_last_rank
+            and (
+                self.speculative_config.use_eagle()
+                or self.speculative_config.uses_draft_model()
+            )
         ):
             assert isinstance(
                 self.drafter,
@@ -6981,9 +7824,14 @@ class GPUModelRunner(
         )
 
         # Initialize drafter's cudagraph dispatcher if using spec decode.
-        if self.speculative_config and (
-            self.speculative_config.use_eagle()
-            or self.speculative_config.uses_extract_hidden_states()
+        # The drafter lives on the last PP rank only.
+        if (
+            self.speculative_config
+            and get_pp_group().is_last_rank
+            and (
+                self.speculative_config.use_eagle()
+                or self.speculative_config.uses_extract_hidden_states()
+            )
         ):
             assert isinstance(
                 self.drafter,

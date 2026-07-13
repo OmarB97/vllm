@@ -380,8 +380,13 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         # the q-head count to B_TOPK (64/128), which requires the index width to be
         # a multiple of 128.
         self.is_dspark = spec_config is not None and spec_config.use_dspark()
+        # SM120 backport: the flashinfer sparse-MLA decode kernels dispatch only
+        # for topk in {128, 512, 1024}; the natural width of 256 would fall
+        # through to the >64-token prefill kernel and crash. Pad to 512 -- the
+        # kernel reads at most topk_length entries per token, so the padding
+        # costs nothing at runtime.
         self.noncausal_index_width = (
-            cdiv(self.window_size + self.num_speculative_tokens, 128) * 128
+            max(512, cdiv(self.window_size + self.num_speculative_tokens, 128) * 128)
             if self.is_dspark
             else 0
         )

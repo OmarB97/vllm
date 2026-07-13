@@ -288,6 +288,9 @@ class UBatchWrapper:
                 cudagraph_metadata.cudagraph,
                 stream=compute_stream,
                 pool=self.graph_pool,
+                # cf. compilation/cuda_graph.py: helper threads (VLLM_MOE_W2
+                # delta ticks) must not invalidate the capture
+                capture_error_mode="thread_local",
             ):
                 ubatch_metadata[0].context.cpu_wait_event.set()
                 for thread in ubatch_threads:
@@ -345,6 +348,8 @@ class UBatchWrapper:
         ubatch_slices,
         attn_metadata,
         slot_mapping,
+        token_slot_mapping,
+        has_prefill,
         input_ids,
         positions,
         inputs_embeds,
@@ -359,6 +364,9 @@ class UBatchWrapper:
         # slot_mapping can be None, an empty dict (from create_forward_context
         # converting None to {}), or a list of dicts (one per ubatch)
         has_slot_mapping = slot_mapping and isinstance(slot_mapping, list)
+        has_token_slot_mapping = isinstance(token_slot_mapping, list)
+        if token_slot_mapping is not None and not has_token_slot_mapping:
+            raise RuntimeError("ubatched token slot mapping must be a list of views")
         for i, ubatch_slice in enumerate(ubatch_slices):
             forward_contexts.append(
                 create_forward_context(
@@ -368,6 +376,10 @@ class UBatchWrapper:
                     batch_descriptor=batch_descriptor,
                     cudagraph_runtime_mode=cudagraph_runtime_mode,
                     slot_mapping=slot_mapping[i] if has_slot_mapping else None,
+                    token_slot_mapping=(
+                        token_slot_mapping[i] if has_token_slot_mapping else None
+                    ),
+                    has_prefill=has_prefill,
                 )
             )
 
@@ -465,6 +477,8 @@ class UBatchWrapper:
 
         attn_metadata = forward_context.attn_metadata
         slot_mapping = forward_context.slot_mapping
+        token_slot_mapping = forward_context.token_slot_mapping
+        has_prefill = forward_context.has_prefill
         num_tokens = sum(ubatch_slice.num_tokens for ubatch_slice in ubatch_slices)
         input_ids = kwargs["input_ids"]
         positions = kwargs["positions"]
@@ -498,6 +512,8 @@ class UBatchWrapper:
                 ubatch_slices=ubatch_slices,
                 attn_metadata=attn_metadata,
                 slot_mapping=slot_mapping,
+                token_slot_mapping=token_slot_mapping,
+                has_prefill=has_prefill,
                 input_ids=input_ids,
                 positions=positions,
                 intermediate_tensors=intermediate_tensors,
@@ -524,6 +540,8 @@ class UBatchWrapper:
                 ubatch_slices=ubatch_slices,
                 attn_metadata=attn_metadata,
                 slot_mapping=slot_mapping,
+                token_slot_mapping=token_slot_mapping,
+                has_prefill=has_prefill,
                 input_ids=input_ids,
                 positions=positions,
                 intermediate_tensors=intermediate_tensors,
